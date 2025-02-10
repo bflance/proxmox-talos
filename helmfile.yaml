@@ -1,0 +1,93 @@
+repositories:
+  - name: metallb
+    url: https://metallb.github.io/metallb
+  - name: prometheus-community
+    url: https://prometheus-community.github.io/helm-charts
+  - name: bitnami
+    url: https://charts.bitnami.com/bitnami
+
+releases:
+  - name: local-path-provisioner
+    namespace: local-path-provisioner
+    chart: ./charts/local-path-provisioner
+    values:
+    - storageClass:
+        create: true
+        defaultClass: true
+    - nodePathMap:
+      - node: DEFAULT_PATH_FOR_NON_LISTED_NODES
+        paths:
+          - /var/local-path-provisioner
+
+  - name: metallb
+    namespace: metallb-system
+    chart: ./charts/metallb
+    needs:
+      - local-path-provisioner/local-path-provisioner
+    hooks:
+    - events: ["postsync", "postapply"]
+      showlogs: true
+      command: "sh"
+      args:
+        - "-c"
+        - |
+          echo "Waiting for MetalLB to be available..."
+          kubectl wait --for=condition=Available --timeout=300s -n metallb-system deployment/metallb-controller || exit 1
+          kubectl apply -f metallb-config.yaml
+
+  - name: nginx-ingress
+    namespace: nginx-ingress
+    chart: ./charts/nginx-ingress-controller
+    needs:
+      - metallb-system/metallb
+
+  - name: kube-prometheus-stack
+    namespace: monitoring
+    chart: ./charts/kube-prometheus-stack
+    needs:
+      - local-path-provisioner/local-path-provisioner
+    values:
+    - kubeEtcd:
+        enabled: true
+        endpoints:
+         - 192.168.0.85
+        service:
+          enabled: true
+          port: 2381
+          targetPort: 2381
+    - prometheus:
+        ingress:
+          enabled: true
+          annotations:
+            kubernetes.io/ingress.class: nginx
+          hosts:
+            - prometheus.mydomain.net
+        prometheusSpec:
+          # serviceMonitorSelectorNilUsesHelmValues: false
+          additionalScrapeConfigs:
+            - job_name: 'talos-cluster'
+              scheme: http
+              metrics_path: '/v1/metrics'
+              static_configs:
+                - targets: ['192.168.0.85:11234']
+    - grafana:
+        defaultDashboardsTimezone: Europe/Berlin
+        ingress:
+          enabled: true
+          annotations:
+            kubernetes.io/ingress.class: nginx
+          hosts:
+            - grafana.mydomain.net
+        additionalDataSources:
+          - name: Loki
+            type: loki
+            isDefault: false
+            access: proxy
+            url: http://loki-grafana-loki-gateway
+            version: 1
+
+  - name: loki
+    namespace: monitoring
+    chart: ./charts/grafana-loki
+    needs:
+      - local-path-provisioner/local-path-provisioner
